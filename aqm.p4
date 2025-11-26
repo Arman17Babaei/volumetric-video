@@ -109,8 +109,7 @@ control MyIngress(inout headers hdr,
                   inout metadata meta,
                   inout standard_metadata_t standard_metadata) {
     action drop() {
-        mark_to_drop();
-    
+        mark_to_drop(standard_metadata);
     }
     
     action ipv4_forward(macAddr_t dstAddr, egressSpec_t port) {
@@ -149,7 +148,7 @@ control MyEgress(inout headers hdr,
 
     action drop() {
         bit<32> dropped_pks;
-        mark_to_drop();
+        mark_to_drop(standard_metadata);
         READ_REG(r_dropped, dropped_pks);
         dropped_pks = dropped_pks + 1;
         WRITE_REG(r_dropped, dropped_pks);
