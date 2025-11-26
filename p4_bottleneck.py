@@ -21,7 +21,7 @@ def build_p4_net(p4src: str = "aqm.p4"):
     net.setLogLevel('info')
 
     info("*** Adding P4 switch and hosts\n")
-    net.addP4Switch('s1')
+    net.addP4Switch('s1', priority_queues_num=2)
     net.addHost('h1', ip=H1_IP)
     net.addHost('h2', ip=H2_IP)
 

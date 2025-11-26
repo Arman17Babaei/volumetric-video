@@ -3,30 +3,42 @@
 #include <v1model.p4>
 
 #define WRITE_REG(r, v) r.write((bit<32>)standard_metadata.egress_port, v);
-#define READ_REG(r, v) r.read(v,(bit<32>)standard_metadata.egress_port);
-#define CAP(c, v, a, t){ if (v > c) a = c; else a = (t)v; }
+#define READ_REG(r, v)  r.read(v, (bit<32>)standard_metadata.egress_port);
+#define CAP(c, v, a, t) { if (v > c) a = c; else a = (t)v; }
 
 const bit<16> TYPE_IPV4 = 0x800;
-const bit<32> MAX_RND = 0xFFFFFFFF;
+const bit<32> MAX_PROB  = 0xFFFFFFFF;
 
-/*************************************************************************
-*********************** H E A D E R S  ***********************************
-*************************************************************************/
+// crude constants for test purposes
+const bit<32> MTU_BYTES = 1500;
 
 typedef bit<9>  egressSpec_t;
 typedef bit<48> macAddr_t;
 typedef bit<32> ip4Addr_t;
-//input parameters
+
+// PI2 parameters
 typedef int<32> alpha_t;
 typedef int<32> beta_t;
-typedef int<32> delay_t;
-typedef bit<5> interval_t;
-//state registers
-register<bit<48>>(256) r_update_time;  // timestamp of previous PI calculation
-register<int<32>>(256) r_queue_delay;  // queue delay at previous PI calculation
-register<bit<32>>(256) r_probability;  // probability at previous PI calculation
-register<bit<32>>(256) r_dropped;      // packets dropped to report in next not dropped packet
+typedef int<32> delay_t;     // same unit as your PI2 code expects
+typedef bit<5>  interval_t;  // update interval exponent (2^interval time units)
 
+// DualPI2 parameters (test adaptation)
+typedef bit<8>  coupling_t;  // k
+typedef bit<2>  ecnmask_t;   // e.g. 2w1 for ECT(1)
+typedef bit<1>  flag_t;
+
+register<bit<48>>(256) r_update_time;
+register<int<32>>(256) r_last_qdelay;
+register<bit<32>>(256) r_probability;
+
+// per-queue last-seen (per egress port)
+register<int<32>>(256)  r_qdelay_c;
+register<int<32>>(256)  r_qdelay_l;
+register<bit<32>>(256)  r_qdepth_c;
+register<bit<32>>(256)  r_qdepth_l;
+
+// drop-reporting (your original style)
+register<bit<32>>(256) r_dropped;
 
 header ethernet_t {
     macAddr_t dstAddr;
@@ -40,9 +52,10 @@ header ipv4_t {
     bit<6>    diffserv;
     bit<2>    ecn;
     bit<16>   totalLen;
-//  bit<16>   identification;  // repurpose identification field...
-    bit<5>    drops;           // up to 31 previous packets dropped
-    bit<11>   qdelay_ms;       // up to 2047ms queue delay
+
+    bit<5>    drops;
+    bit<11>   qdelay_ms;
+
     bit<3>    flags;
     bit<13>   fragOffset;
     bit<8>    ttl;
@@ -53,28 +66,19 @@ header ipv4_t {
 }
 
 struct metadata {
-    bit<1>   mark_drop;
+    bit<1> mark_drop;
 }
 
 struct headers {
-    ethernet_t   ethernet;
-    ipv4_t       ipv4;
+    ethernet_t ethernet;
+    ipv4_t     ipv4;
 }
 
-error { IPHeaderTooShort }
-
-/*************************************************************************
-*********************** P A R S E R  ***********************************
-*************************************************************************/
-
 parser MyParser(packet_in packet,
-                  out headers hdr,
-                  inout metadata meta,
-                  inout standard_metadata_t standard_metadata) {
-
-    state start {
-        transition parse_ethernet;
-    }
+                out headers hdr,
+                inout metadata meta,
+                inout standard_metadata_t standard_metadata) {
+    state start { transition parse_ethernet; }
 
     state parse_ethernet {
         packet.extract(hdr.ethernet);
@@ -87,31 +91,19 @@ parser MyParser(packet_in packet,
     state parse_ipv4 {
         packet.extract(hdr.ipv4);
         transition accept;
-    } 
-
+    }
 }
 
-
-/*************************************************************************
-************   C H E C K S U M    V E R I F I C A T I O N   *************
-*************************************************************************/
-
-control MyVerifyChecksum(inout headers hdr, inout metadata meta) {   
-    apply {  }
+control MyVerifyChecksum(inout headers hdr, inout metadata meta) {
+    apply { }
 }
-
-
-/*************************************************************************
-**************  I N G R E S S   P R O C E S S I N G   *******************
-*************************************************************************/
 
 control MyIngress(inout headers hdr,
                   inout metadata meta,
                   inout standard_metadata_t standard_metadata) {
-    action drop() {
-        mark_to_drop(standard_metadata);
-    }
-    
+
+    action drop() { mark_to_drop(standard_metadata); }
+
     action ipv4_forward(macAddr_t dstAddr, egressSpec_t port) {
         standard_metadata.egress_spec = port;
         hdr.ethernet.srcAddr = hdr.ethernet.dstAddr;
@@ -120,159 +112,277 @@ control MyIngress(inout headers hdr,
     }
 
     table ipv4_lpm {
-        key = {
-            hdr.ipv4.dstAddr: lpm;
-        }
-        actions = {
-            ipv4_forward;
-            drop;
-        }
+        key = { hdr.ipv4.dstAddr: lpm; }
+        actions = { ipv4_forward; drop; }
         size = 1024;
         default_action = drop;
     }
- 
+
     apply {
         if (hdr.ipv4.isValid()) {
             ipv4_lpm.apply();
+
+            // DualQ split using L4S identifier:
+            // ECT(1) or CE => LSB mask 2w1 matches
+            // priority: 0 is highest in simple_switch
+            if ((hdr.ipv4.ecn & 2w1) == 2w1) {
+                standard_metadata.priority = 3w0; // L queue = 0
+            } else {
+                standard_metadata.priority = 3w1; // C queue = 1
+            }
         }
     }
 }
 
-/*************************************************************************
-****************  E G R E S S   P R O C E S S I N G   *******************
-*************************************************************************/
-
 control MyEgress(inout headers hdr,
                  inout metadata meta,
-                 inout standard_metadata_t standard_metadata){
+                 inout standard_metadata_t standard_metadata) {
 
-    action drop() {
-        bit<32> dropped_pks;
+    action drop_and_count() {
+        bit<32> dropped_pks = 0;
         mark_to_drop(standard_metadata);
         READ_REG(r_dropped, dropped_pks);
         dropped_pks = dropped_pks + 1;
         WRITE_REG(r_dropped, dropped_pks);
     }
 
-    // alpha and beta needs to be multiplied by (2^32-1)/1000000 = 4295 which is due to random value goes to 2^32
-    // alpha = 0,3125 => 1342 and beta = 3,125 => 13422
-    // delay target is in us = 20000 => 20 msec
-    // PI update interval is 2^x us, x = 15 => 32768 us ~= 33 msec
-    action pi2(alpha_t alpha, beta_t beta, delay_t target, interval_t interval){
+    // IMPORTANT: cap_prob MUST be provided by control plane as:
+    //    cap_prob = floor(MAX_PROB / coupling_factor)
+    // This avoids runtime division (unsupported in BMv2/p4c).
+    action dualpi2(alpha_t alpha,
+                  beta_t beta,
+                  delay_t target,
+                  interval_t interval,
+                  coupling_t coupling_factor,
+                  bit<32> cap_prob,
+                  ecnmask_t ecn_mask,
+                  flag_t drop_overload,
+                  delay_t step_thresh,
+                  flag_t step_in_packets) {
+
+        /***************
+         * 0) Init locals (fix uninitialized warnings)
+         ***************/
+        meta.mark_drop = 1w0;
+
+        bit<48> now = standard_metadata.egress_global_timestamp;
+
         bit<48> last_update_time = 0;
-        int<32> last_queue_delay;
-        bit<32> last_probability;
-    
-        READ_REG(r_update_time, last_update_time);  // read r_update_time -> timestamp of last prob update
-        READ_REG(r_queue_delay, last_queue_delay);  // read q_delay during previous update time
-        READ_REG(r_probability, last_probability);  // read last calculated PI probability 
-  
-        // initialization - no previous update time
-        if (last_update_time == 0) {
-            last_update_time = standard_metadata.egress_global_timestamp;
-        }
-        //find how many time laps - divide by 2^interval = 32768
-        bit<32> update_laps = (bit<32>) ((standard_metadata.egress_global_timestamp - last_update_time) >> interval); 
+        int<32> last_qdelay_max  = 0;
+        bit<32> prob             = 0;
 
-        if (update_laps >= 1){
-            if (update_laps >= 2000) update_laps = 2000;   // limit to max useful number = max queue_del / min target (1ms)
+        int<32> qdelay_c = 0;
+        int<32> qdelay_l = 0;
+        bit<32> qdepth_c = 0;
+        bit<32> qdepth_l = 0;
 
-            int<32> prev_queue_delay = last_queue_delay;   // preserve previous queue delay
-            CAP(1000000, standard_metadata.deq_timedelta, last_queue_delay, int<32>); // update and cap queueing delay to 1s
+        int<32> qdelay_now = 0;
+        bit<32> qdepth_now = 0;
 
-            // calculate change in probability;  subtract extra alpha.TARGET for every extra lap Q assumed 0
-            int<32> delta = (last_queue_delay - (int<32>)update_laps * target) * alpha + (last_queue_delay - prev_queue_delay) * beta;
-            bit<33> new_probability = (bit<33>) last_probability; // add one bit to detect under- and overflows
-            new_probability = (bit<33>) ((int<33>) new_probability + (int<33>) delta);  // delta needs sign preservation
-            if (new_probability > (bit<33>)MAX_RND) { // check for under- and overflows
-                if (delta > 0) last_probability = MAX_RND;
-                else last_probability = 0;
-            } else last_probability = (bit<32>) new_probability; // otherwise update latest probability
+        bit<32> r1 = 0;
+        bit<32> r2 = 0;
+        bit<32> rL = 0;
 
-            last_update_time = standard_metadata.egress_global_timestamp; // set last_update_time
-        }
+        /***************
+         * 1) EXTERN CALLS FIRST (must be unconditional in actions)
+         ***************/
+        READ_REG(r_update_time, last_update_time);
+        READ_REG(r_last_qdelay, last_qdelay_max);
+        READ_REG(r_probability, prob);
 
-        //update registers
-        WRITE_REG(r_probability, last_probability); // store new drop probability
-        WRITE_REG(r_queue_delay, last_queue_delay); // store delay	
-        WRITE_REG(r_update_time, last_update_time); // store last_update_time
+        READ_REG(r_qdelay_c, qdelay_c);
+        READ_REG(r_qdelay_l, qdelay_l);
+        READ_REG(r_qdepth_c, qdepth_c);
+        READ_REG(r_qdepth_l, qdepth_l);
 
-        bit<32> rnd;
-        random(rnd,0,MAX_RND);
+        CAP(1000000, standard_metadata.deq_timedelta, qdelay_now, int<32>);
+        qdepth_now = (bit<32>) standard_metadata.deq_qdepth;
 
-        //check based on p (scalable)  or p (non scalable) and mark or drop
-        if (hdr.ipv4.ecn & 2 == 2) { // scalable tcp if ecn
-	      if ((rnd>>1) < last_probability) 
-                 	hdr.ipv4.ecn = 3;         // mark insteaf of drop
+        random(r1, 0, MAX_PROB);
+        random(r2, 0, MAX_PROB);
+        random(rL, 0, MAX_PROB);
+
+        /***************
+         * 2) Pure logic (no externs)
+         ***************/
+        bit<1> is_l4s = (((hdr.ipv4.ecn & ecn_mask) != 2w0) ? 1w1 : 1w0);
+
+        // update last-seen per-queue delay/depth
+        if (is_l4s == 1w1) {
+            qdelay_l = qdelay_now;
+            qdepth_l = qdepth_now;
         } else {
-              if ((rnd < last_probability) && ((rnd << 16) < last_probability)) // squaring by using 16 lsb as second independent random value
-                    meta.mark_drop = 1;         
+            qdelay_c = qdelay_now;
+            qdepth_c = qdepth_now;
         }
-    }
-    
 
-    table aqm{
-        key = {
-            standard_metadata.egress_port: exact;
-        }    
-        actions = {
-            pi2();
-            NoAction;
+        bit<32> backlog_bytes = qdepth_c + qdepth_l;
+        bit<1> allow_aqm = (backlog_bytes >= (2 * MTU_BYTES)) ? 1w1 : 1w0;
+
+        int<32> qdelay_max = (qdelay_l > qdelay_c) ? qdelay_l : qdelay_c;
+
+        if (last_update_time == 0) {
+            last_update_time = now;
         }
-        default_action = NoAction; 
+
+        bit<32> update_laps =
+            (bit<32>) ((now - last_update_time) >> interval);
+
+        if (update_laps >= 1) {
+            if (update_laps >= 2000) update_laps = 2000;
+
+            int<32> prev_qdelay_max = last_qdelay_max;
+            int<32> laps_target = (int<32>)update_laps * target;
+
+            int<32> delta = (qdelay_max - laps_target) * alpha
+                          + (qdelay_max - prev_qdelay_max) * beta;
+
+            bit<33> new_prob = (bit<33>) prob;
+            new_prob = (bit<33>) ((int<33>)new_prob + (int<33>)delta);
+
+            if (new_prob > (bit<33>)MAX_PROB) {
+                if (delta > 0) prob = MAX_PROB;
+                else           prob = 0;
+            } else {
+                prob = (bit<32>) new_prob;
+            }
+
+            last_update_time = now;
+            last_qdelay_max  = qdelay_max;
+
+            // kernel behavior when !drop_overload:
+            // cap so that k * p' does not exceed 100%.
+            // (division done in control plane -> cap_prob)
+            if (drop_overload == 1w0 && coupling_factor != 0) {
+                if (prob > cap_prob) prob = cap_prob;
+            }
+        }
+
+        // overload check using 64b multiply (no division)
+        bit<64> local_l_prob64 = (bit<64>)prob * (bit<64>)coupling_factor;
+        bit<1> overload = (local_l_prob64 > (bit<64>)MAX_PROB) ? 1w1 : 1w0;
+        bit<32> local_l_prob = (overload == 1w1) ? MAX_PROB : (bit<32>)local_l_prob64;
+
+        // ECT?
+        bit<2> ect = hdr.ipv4.ecn;
+        bit<1> not_ect = (ect == 2w0) ? 1w1 : 1w0;
+        bit<1> ecn_capable = (ect != 2w0) ? 1w1 : 1w0;
+
+        bit<1> classic_trigger = ((r1 <= prob) && (r2 <= prob)) ? 1w1 : 1w0;
+
+        /***************
+         * 3) Mark/drop logic (no externs)
+         ***************/
+        if (allow_aqm == 1w1) {
+            if (is_l4s == 1w0) {
+                // Classic queue: pC ~= (p')^2
+                if (classic_trigger == 1w1) {
+                    if (overload == 1w1 || not_ect == 1w1) {
+                        meta.mark_drop = 1w1;
+                    } else {
+                        hdr.ipv4.ecn = 2w3; // CE
+                    }
+                }
+            } else {
+                // L4S queue: pL = k*p'
+                if (overload == 1w1) {
+                    // trade losses to preserve latency when configured
+                    if (drop_overload == 1w1 && classic_trigger == 1w1) {
+                        meta.mark_drop = 1w1;
+                    } else {
+                        if (not_ect == 1w1) meta.mark_drop = 1w1;
+                        else hdr.ipv4.ecn = 2w3;
+                    }
+                } else {
+                    if (rL <= local_l_prob) {
+                        if (not_ect == 1w1) meta.mark_drop = 1w1;
+                        else hdr.ipv4.ecn = 2w3;
+                    }
+                }
+
+                // Step AQM (approx) for L queue only
+                if (meta.mark_drop == 1w0 && step_thresh > 0) {
+                    bit<1> step_hit = 1w0;
+
+                    if (step_in_packets == 1w1) {
+                        // treat step_thresh as packets (convert to bytes roughly)
+                        bit<32> thresh_bytes = (bit<32>)step_thresh * MTU_BYTES;
+                        if ((bit<32>)standard_metadata.enq_qdepth > thresh_bytes)
+                            step_hit = 1w1;
+                    } else {
+                        // treat step_thresh in same time unit as qdelay_now
+                        if (qdelay_now > step_thresh) step_hit = 1w1;
+                    }
+
+                    if (step_hit == 1w1) {
+                        if (ecn_capable == 1w0) meta.mark_drop = 1w1;
+                        else hdr.ipv4.ecn = 2w3;
+                    }
+                }
+            }
+        }
+
+        /***************
+         * 4) EXTERN WRITES LAST (unconditional)
+         ***************/
+        WRITE_REG(r_qdelay_c, qdelay_c);
+        WRITE_REG(r_qdelay_l, qdelay_l);
+        WRITE_REG(r_qdepth_c, qdepth_c);
+        WRITE_REG(r_qdepth_l, qdepth_l);
+
+        WRITE_REG(r_probability, prob);
+        WRITE_REG(r_last_qdelay, last_qdelay_max);
+        WRITE_REG(r_update_time, last_update_time);
     }
 
+    table aqm {
+        key = { standard_metadata.egress_port: exact; }
+        actions = { dualpi2(); NoAction; }
+        default_action = NoAction;
+    }
 
     apply {
-        // store queuing delay in ms (up to 2047ms)
-        hdr.ipv4.qdelay_ms = (bit<11>)(standard_metadata.deq_timedelta >> 10);
+        if (hdr.ipv4.isValid()) {
+            hdr.ipv4.qdelay_ms = (bit<11>)(standard_metadata.deq_timedelta >> 10);
 
-        aqm.apply();    
-        if (meta.mark_drop == 1) {
-            drop();
-        } else {
-            bit<32> dropped_pks;
-            bit<5> drops;
-            READ_REG(r_dropped, dropped_pks);
-            CAP(31, dropped_pks, drops, bit<5>); // max 31 drops can be reported
-            dropped_pks = dropped_pks - (bit<32>)drops;
-            WRITE_REG(r_dropped, dropped_pks);
-            hdr.ipv4.drops = drops;
+            aqm.apply();
+
+            if (meta.mark_drop == 1w1) {
+                drop_and_count();
+            } else {
+                bit<32> dropped_pks = 0;
+                bit<5> drops = 0;
+                READ_REG(r_dropped, dropped_pks);
+                CAP(31, dropped_pks, drops, bit<5>);
+                dropped_pks = dropped_pks - (bit<32>)drops;
+                WRITE_REG(r_dropped, dropped_pks);
+                hdr.ipv4.drops = drops;
+            }
         }
     }
-
 }
-
-/*************************************************************************
-*************   C H E C K S U M    C O M P U T A T I O N   **************
-*************************************************************************/
 
 control MyComputeChecksum(inout headers hdr, inout metadata meta) {
     apply {
-    update_checksum(
-        hdr.ipv4.isValid(),
-        { hdr.ipv4.version,
-          hdr.ipv4.ihl,
-          hdr.ipv4.diffserv,
-          hdr.ipv4.ecn,
-          hdr.ipv4.totalLen,
-//        hdr.ipv4.identification,
-          hdr.ipv4.drops,
-          hdr.ipv4.qdelay_ms,
-          hdr.ipv4.flags,
-          hdr.ipv4.fragOffset,
-          hdr.ipv4.ttl,
-          hdr.ipv4.protocol,
-          hdr.ipv4.srcAddr,
-          hdr.ipv4.dstAddr },
-        hdr.ipv4.hdrChecksum,
-        HashAlgorithm.csum16);
+        update_checksum(
+            hdr.ipv4.isValid(),
+            { hdr.ipv4.version,
+              hdr.ipv4.ihl,
+              hdr.ipv4.diffserv,
+              hdr.ipv4.ecn,
+              hdr.ipv4.totalLen,
+              hdr.ipv4.drops,
+              hdr.ipv4.qdelay_ms,
+              hdr.ipv4.flags,
+              hdr.ipv4.fragOffset,
+              hdr.ipv4.ttl,
+              hdr.ipv4.protocol,
+              hdr.ipv4.srcAddr,
+              hdr.ipv4.dstAddr },
+            hdr.ipv4.hdrChecksum,
+            HashAlgorithm.csum16);
     }
 }
-
-/*************************************************************************
-***********************  D E P A R S E R  *******************************
-*************************************************************************/
 
 control MyDeparser(packet_out packet, in headers hdr) {
     apply {
@@ -281,15 +391,11 @@ control MyDeparser(packet_out packet, in headers hdr) {
     }
 }
 
-/*************************************************************************
-***********************  S W I T C H  *******************************
-*************************************************************************/
-
 V1Switch(
-MyParser(),
-MyVerifyChecksum(),
-MyIngress(),
-MyEgress(),
-MyComputeChecksum(),
-MyDeparser()
+    MyParser(),
+    MyVerifyChecksum(),
+    MyIngress(),
+    MyEgress(),
+    MyComputeChecksum(),
+    MyDeparser()
 ) main;
