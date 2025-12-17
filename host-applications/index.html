@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8"/>
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dash JS Player - Bola</title>
+    <script type="text/javascript" src="https://cdn.dashjs.org/v5.0.0/legacy/umd/dash.all.min.js"></script>
+</head>
+<body style="margin: 10px">
+<div style="display:inline-block;text-align:center">
+    <h1>DASH.js player</h1>
+    <video style="width:1280px" controls="true" id="video" muted></video>
+</div>
+
+<script type="text/javascript">
+    // Configuration
+    const uuid = "93dsf81nzaw3";
+    const abrType = "ThroughputRule";
+    const mpdURL = "BBB/4s/manifest.mpd";
+    
+    // Utility fallback values
+    const deviceResolution = `${window.screen.width}x${window.screen.height}`;
+    const deviceType = "Desktop";
+
+    // Video player setup
+    const video = document.getElementById('video');
+    const player = dashjs.MediaPlayer().create();
+
+    let segmentLength = 1;
+    let frameRate = 20;
+    let indexOffset = 0;
+    let isVideoInitializationSegment = false;
+
+    let segmentsInfo = [];
+    let stallsInfo = [];
+    let startStallTime = null;
+    let ladder = [];
+
+    const itu_t_input = {
+        "IGen": {
+            "mpd": mpdURL,
+            "displaySize": deviceResolution,
+            "device": deviceType,
+            "viewingDistance": 150
+        },
+        "I13": { "streamId": 42, "segments": [] },
+        "I11": { "streamId": 42, "segments": [] },
+        "I23": { "streamId": 42, "stalling": [] }
+    };
+
+    function addValuesToSegmentsInfo(index, quality, strategy, buffer) {
+        if (index === 0) indexOffset = 1;
+        index += indexOffset;
+
+        const existingSegment = segmentsInfo.find(s => s.index === index);
+        if (existingSegment) {
+            existingSegment.quality = quality;
+            existingSegment.strategy = strategy;
+            existingSegment.buffer = buffer;
+        } else {
+            console.log("Adding segment with index " + index);
+            segmentsInfo.push({ index, quality, strategy, buffer });
+        }
+    }
+
+    function createJSON(itu_t_input, segmentsInfo) {
+        let startTime = 0.0;
+        // Add this to debug the values
+        // console.log("SegmentsInfo: ", segmentsInfo);  // Log the populated segmentsInfo array
+        for (const segment of segmentsInfo) {
+            itu_t_input.I13.segments.push({
+                index: segment.index,
+                strategy: segment.strategy,
+                buffer: segment.buffer,
+                codec: "vp9", // Change this or inherit from mpd
+                start: startTime,
+                duration: segmentLength,
+                resolution: `${ladder[segment.quality].width}x${ladder[segment.quality].height}`,
+                bitrate: ladder[segment.quality].bandwidth,
+                fps: ladder[segment.quality].frameRate
+            });
+            startTime += segmentLength;
+        }
+
+        for (const stall of stallsInfo) {
+            itu_t_input.I23.stalling.push({
+                start: stall.startTime,
+                duration: stall.duration
+            });
+        }
+
+        return itu_t_input;
+    }
+    
+    function sendLogToServer(logData, serverUrl = 'http://localhost:8000/') {
+        const json = JSON.stringify(logData, null, 2); // Pretty-print
+        fetch(serverUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',  // Ensure the correct Content-Type
+            },
+            body: json,
+        })
+        .then(response => response.text())
+        .then(data => {
+            console.log("Log saved successfully:", data);
+        })
+        .catch(error => {
+            console.error("Error saving log to server:", error);
+        });
+    }
+
+    function comp(propertyName) {
+        return function (a, b) {
+            return a[propertyName] - b[propertyName];
+        };
+    }
+
+    function initializePlayer(player, videoElement, abrType) {
+        player.updateSettings({
+            debug: { logLevel: dashjs.Debug.LOG_LEVEL_WARNING },
+            streaming: {
+                buffer: {
+                    bufferTimeAtTopQuality: 4, // 35,
+                    bufferTimeAtTopQualityLongForm: 4, // 35,
+                    bufferTimeDefault: 4, // 35, // stableBufferTime: 35, // dash.js v4 --> v5
+                    fastSwitchEnabled: false
+                },
+                abr: {
+                    rules: {
+                        throughputRule: {
+                            active: false
+                        },
+                        bolaRule: {
+                            active: false
+                        },
+                        insufficientBufferRule: {
+                            active: false
+                        },
+                        switchHistoryRule: {
+                            active: false
+                        },
+                        droppedFramesRule: {
+                            active: false
+                        },
+                        abandonRequestsRule: {
+                            active: false
+                        },
+                        l2ARule: {
+                            active: false
+                        },
+                        loLPRule: {
+                            active: false
+                        }
+                    }
+                },
+                cmsd: { enabled: true }
+            }
+        });
+        
+        if (abrType === "ThroughputRule") {
+            player.updateSettings({
+                streaming: {
+                    abr: {
+                        rules: {
+                            throughputRule: {
+                                active: true                         }
+                        }
+                    }
+                }
+            });
+        } else if (abrType === "BolaRule") {
+            player.updateSettings({
+                streaming: {
+                    abr: {
+                        rules: {
+                            bolaRule: {
+                                active: true
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        player.initialize(videoElement, mpdURL, true);
+
+        player.on(dashjs.MediaPlayer.events.FRAGMENT_LOADING_COMPLETED, (e) => {
+            // console.log(e);
+            if (e.request.mediaType === "video" && e.request.type === "MediaSegment") {
+                const buffer = player.getBufferLength(e.request.mediaType).toFixed(3);
+                addValuesToSegmentsInfo(e.request.index, e.request.representation.absoluteIndex, abrType, buffer);
+                console.log("Segment loaded:", e.request.index);
+            }
+        });
+
+        player.on(dashjs.MediaPlayer.events.FRAGMENT_LOADING_STARTED, (e) => {
+            isVideoInitializationSegment = (e.mediaType === "video" || e.mediaType === "audio") &&
+                                           e.request.type === "InitializationSegment";
+        });
+
+        player.on(dashjs.MediaPlayer.events.PLAYBACK_PLAYING, () => {
+            if (stallsInfo.length && stallsInfo[stallsInfo.length - 1].duration === 0) {
+                let stallDuration = (Date.now() - startStallTime) / 1000;
+                stallsInfo[stallsInfo.length - 1].duration = stallDuration;
+                console.log("Stall duration: ", stallDuration);
+            }
+        });
+        
+        player.on(dashjs.MediaPlayer.events.MANIFEST_LOADED, (e) => {
+            
+            // console.log("MANIFEST_LOADED", e);
+            
+            stallsInfo.push({ startTime: 0, duration: 0 });
+            startStallTime = Date.now();
+
+            const mpd = e.data;
+            const period = mpd?.Period?.[0];
+
+            if (!period || !period.AdaptationSet) {
+                console.warn("No AdaptationSets found in manifest.");
+                return;
+            }
+
+            // Find video adaptation set by checking mimeType in Representations
+            const videoAdaptationSet = period.AdaptationSet.find(as => {
+                const reps = Array.isArray(as.Representation) ? as.Representation : [as.Representation];
+                return reps.some(rep => rep.mimeType?.startsWith('video/'));
+            });
+
+            if (!videoAdaptationSet) {
+                console.warn("No video AdaptationSet found.");
+                return;
+            }
+
+            // Get representations and sort by bandwidth
+            let representations = Array.isArray(videoAdaptationSet.Representation)
+                ? videoAdaptationSet.Representation
+                : [videoAdaptationSet.Representation];
+
+            representations.sort((a, b) => a.bandwidth - b.bandwidth);
+
+            // Get segment template from AdaptationSet or fallback to first Representation
+            let segmentTemplate = videoAdaptationSet.SegmentTemplate || representations[0]?.SegmentTemplate;
+
+            if (!segmentTemplate) {
+                console.warn("No SegmentTemplate found in manifest.");
+                return;
+            }
+
+            segmentLength = segmentTemplate.duration / segmentTemplate.timescale;
+            frameRate = videoAdaptationSet.maxFrameRate || representations[0].frameRate;
+
+            /*
+            console.log(`[ADAPTATION SET]`);
+            console.log(`- Segment duration: ${segmentDuration.toFixed(2)} seconds`);
+            console.log(`- Max Frame Rate: ${maxFrameRate} fps`);
+            console.log(`- Segment Template Media: ${segmentTemplate.media}`);
+            console.log(`- Initialization Segment: ${segmentTemplate.initialization}`);
+
+            console.log(`[REPRESENTATION LADDER]`);
+            representations.forEach((rep, idx) => {
+                console.log(`Quality ${idx}:`);
+                console.log(`- ID: ${rep.id}`);
+                console.log(`- Bitrate: ${rep.bandwidth} bps`);
+                console.log(`- Resolution: ${rep.width}x${rep.height}`);
+                console.log(`- Frame Rate: ${rep.frameRate}`);
+                console.log(`- Codecs: ${rep.codecs}`);
+            });
+            */
+
+            ladder = representations;
+            ladder.sort(comp('bandwidth'));
+        });
+
+        player.on(dashjs.MediaPlayer.events.BUFFER_LEVEL_STATE_CHANGED, (e) => {
+            if (e.state === "bufferStalled") {
+                const currentTime = player.time(player.getActiveStream().getStreamId());
+                stallsInfo.push({ startTime: currentTime, duration: 0 });
+                startStallTime = Date.now();
+            }
+        });
+        
+        // Extend RequestModifier class and implement our own behaviour (working for dashjs before v5)
+        /*
+        player.extend("RequestModifier", function () {
+        	return {
+                modifyRequestURL: function (url) {                
+                    if (url.includes('?id=')) {
+                        return url; // Return the URL as is if parameters are already present
+                    }
+                    if (!(url.includes(".mpd") || isVideoInitializationSegment) && segmentsInfo.length > 0){
+                        const throughput = player.getAverageThroughput("video").toFixed(0); // kbps
+                        const bufferLength = player.getBufferLength("video").toFixed(3);
+                        const isLastStallHappened = typeof startStallTime === 'number' && (Date.now() - startStallTime < 5000); // Startup delay also considered
+                        return url + '?id=' + uuid + '&t=' + throughput + '&bl=' + bufferLength + '&sl=' + segmentLength + '&sh=' + isLastStallHappened;
+                    }
+                	// Modify url adding a custom query string parameter
+                	return url + '?id=' + uuid;
+                }
+            };
+        });
+        */
+    }
+
+    function handlePlaybackEnded() {
+        console.log("Player playback ended.");
+        const jsonData = createJSON(itu_t_input, segmentsInfo);
+        sendLogToServer(jsonData);
+    }
+    
+    function addRequestInterceptor() {
+        if (!player) return;
+
+        // const interceptor: RequestInterceptor = async (request: CommonMediaRequest) => {
+        const interceptor = async (request) => {
+            try {
+                const url = new URL(request.url);
+
+                // Only modify media segment requests (skip manifest, init segments, etc.)
+                if (url.toString().includes('?id=')) {
+                        return url; // Return the URL as is if parameters are already present
+                }
+                if (!(url.toString().includes(".mpd") || isVideoInitializationSegment) && segmentsInfo.length > 0){
+                    const throughput = player.getAverageThroughput("video")?.toFixed(0) || "0"; // in kbps
+                    const bufferLength = player.getBufferLength("video")?.toFixed(3) || "0";
+                    const isLastStallHappened = window.startStallTime === "number" && (Date.now() - window.startStallTime < 5000);
+
+                    // Append all custom query parameters
+                    url.searchParams.set("id", uuid);
+                    url.searchParams.set("t", throughput);
+                    url.searchParams.set("bl", bufferLength);
+                    url.searchParams.set("sl", segmentLength.toString());
+                    url.searchParams.set("sh", isLastStallHappened.toString());
+
+                    request.url = url.toString();
+                    console.log("[Interceptor] Final URL:", request.url);
+                }
+
+                return request;
+            } catch (err) {
+                console.warn("Request interceptor failed:", err);
+                return request;
+            }
+        };
+
+        player.addRequestInterceptor(interceptor);
+    }
+    
+    function addResponseInterceptor() {
+        if (!player) return;
+
+        const interceptor = async (response) => {
+            try {
+                const headers = response.headers;
+                
+                console.log(headers);
+
+                // Modify this based on the parameters sent by the server
+                console.log("Server echoed:", {
+                    id: headers["x-param-id"],
+                    throughput: headers["x-param-t"],
+                    bufferLength: headers["x-param-bl"]
+                });
+                
+                // Do something with the parameters or store them somewhere
+
+                return response;
+            } catch (err) {
+                console.warn("Response interceptor failed:", err);
+                return response;
+            }
+        };
+
+        player.addResponseInterceptor(interceptor);
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        // console.log("MPD URL:", mpdURL);
+        initializePlayer(player, video, abrType);
+        
+        // Initialize request interceptor (handling CMCD-like parameters)
+        addRequestInterceptor();
+        
+        // Initialize response interceptor (handling CMSD-like parameters)
+        addResponseInterceptor();
+
+        let timeoutId;
+        let endedTriggered = false; // Prevent duplicate calls
+        let timeoutLength = 2 * 60 * 1000; // timeout
+
+        // Set timeout for 2 minutes
+        timeoutId = setTimeout(() => {
+            if (!endedTriggered) {
+                endedTriggered = true;
+                handlePlaybackEnded();
+            }
+        }, timeoutLength);
+
+        // Listen for PLAYBACK_ENDED event
+        player.on(dashjs.MediaPlayer.events.PLAYBACK_ENDED, () => {
+            if (!endedTriggered) {
+                endedTriggered = true;
+                clearTimeout(timeoutId); // Cancel the timeout
+                handlePlaybackEnded();
+            }
+        });
+    });
+</script>
+</body>
+</html>
