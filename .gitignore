@@ -6,3 +6,7 @@ log/
 pcap/
 
 __pycache__/
+
+host-applications/BBB/
+host-applications/logs/
+host-applications/player_log.txt
