@@ -24,6 +24,7 @@ def parse_args():
     """
     parser = argparse.ArgumentParser(description="Modify JavaScript variables for DASH scenarios.")
     parser.add_argument('--runs', type=int, required=True, help="Specify the number of runs for each scenario.")
+    parser.add_argument('--srv_addr', type=str, required=False, default='localhost', help="IP address of server")
     return parser.parse_args()
 
 # Function to run the player
@@ -40,21 +41,19 @@ def runPlayer(playerURL, duration):
     d['goog:loggingPrefs'] = {'browser': 'ALL'}
     options = Options()
     options.add_argument('--headless')
-    # options.add_argument("--headless=new")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--remote-debugging-port=0")
 
     options.add_argument('--no-sandbox')
     options.add_argument('--auto-open-devtools-for-tabs')
     options.add_argument('--autoplay-policy=no-user-gesture-required')
-    # options.add_argument("--proxy-server=http://10.0.2.2:2080")
     options.add_argument('--incognito')  # Use incognito mode
     options.set_capability('cloud:options', d)
 
     elapsed_time = 0
     poll_interval = 10  # Time (in seconds) between each check
 
-    # service = Service("/usr/bin/chromedriver", log_output=f"/tmp/chromedriver.log")
+    service = Service("/usr/bin/google-chrome-stable", log_output=f"/tmp/chromedriver.log")
     driver = webdriver.Chrome(options=options)
     
     driver.execute_cdp_cmd("Network.enable", {})
@@ -75,7 +74,7 @@ def runPlayer(playerURL, duration):
                 f.write(str(entry) + '\n')
                 f.flush()  # Ensure the data is written to the file immediately
                 if "File successfully uploaded" in str(entry) or "Error uploading the file" in str(entry):
-                    # print(f"Results file uploaded succesfully... Terminating player...")
+                    print(f"Results file uploaded succesfully... Terminating player...")
                     stop_players = True
                     break
                 elif "No video bytes to push or stream is inactive" in str(entry):
@@ -89,18 +88,21 @@ def runPlayer(playerURL, duration):
             time.sleep(poll_interval)  # Wait before checking again
             elapsed_time += poll_interval
             
-            # print(f"stop_players is: {stop_players}")
+            print(f"stop_players is: {stop_players}")
             
     driver.quit()
 
 if __name__ == "__main__":
     runs = 1
+    srv_addr = 'localhost'
 
     # Parse the command-line argument
     args = parse_args()
     if args:
         if args.runs:
             runs = args.runs  # Get the number of runs from command-line input
+        if args.srv_addr:
+            srv_addr = args.srv_addr
     
     for i in range(runs):
         print(f"Run #{i + 1}/{runs}")
@@ -108,6 +110,6 @@ if __name__ == "__main__":
         
         # Start a process for the client with the assigned file
         # process = multiprocessing.Process(target=runPlayer, args=(f"file:///home/zenzi/Documents/LiveVMAF/client/index.html", duration_t))
-        process = multiprocessing.Process(target=runPlayer, args=(f"http://localhost:8123/index.html", duration_t))
+        process = multiprocessing.Process(target=runPlayer, args=(f"http://{srv_addr}:8123/index.html", duration_t))
         process.start()
         process.join()

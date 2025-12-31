@@ -1,6 +1,7 @@
 from http.server import BaseHTTPRequestHandler,HTTPServer
 import requests
 import os,threading
+import time
 
 main_ladder=[7000000,
              6500000,6000000,
@@ -10,13 +11,25 @@ main_ladder=[7000000,
              2800000,2500000,2250000,2000000,
              1800000,1600000,1400000,1200000,1100000,1000000,
              900000,750000,600000,500000,365000,240000,145000,90000]
+
+def get_with_retry(url):
+    retries = 0
+    while True:
+        try:
+            resp = requests.get(url)
+            return resp.content
+        except Exception as e:
+            print(e)
+            retries += 1
+            print(f"retrying for {retries}th time...")
+            time.sleep(.5)
+
 def downloader(t,br):
         u1 = 'https://farzad-artemis.s3.eu-central-1.amazonaws.com/artemis1s/RtmpLiveEncoding/video/'+str(br)+'/segment_'+str(t)+'.m4s'
         # u1 = 'https://farzad-artemis.s3.eu-central-1.amazonaws.com/artemis2s/RtmpLiveEncoding/video/'+str(br)+'/segment_'+str(t)+'.m4s'
 
         print(u1)
-        resp = requests.get(u1)
-        data = resp.content
+        data = get_with_retry(u1)
         f = open(str(br)+'/segment_'+str(t)+'.m4s', 'wb')
         f.write(data)
         f.close()
@@ -26,8 +39,7 @@ for br in main_ladder:
     u1 = 'https://farzad-artemis.s3.eu-central-1.amazonaws.com/artemis1s/RtmpLiveEncoding/video/'+str(br)+'/init.mp4'
     # u1 = 'https://farzad-artemis.s3.eu-central-1.amazonaws.com/artemis2s/RtmpLiveEncoding/video/'+str(br)+'/init.mp4'
 
-    resp = requests.get(u1)
-    data = resp.content
+    data = get_with_retry(u1)
     f = open(str(br) + '/init.mp4', 'wb')
     f.write(data)
     f.close()

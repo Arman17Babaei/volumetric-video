@@ -3,6 +3,7 @@
 #!/usr/bin/env python3
 
 from mininet.log import setLogLevel, info
+from mininet.cli import CLI
 
 from common import (
     endpoint_tuning,
@@ -54,7 +55,7 @@ def main():
 
         info("*** Artifacts: /tmp/ping_l4s.log "
              "/tmp/ping_classic.log /tmp/iperf_server.log\n")
-
+        CLI(net)
     finally:
         net.stop()
 

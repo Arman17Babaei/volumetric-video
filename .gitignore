@@ -8,5 +8,9 @@ pcap/
 __pycache__/
 
 host-applications/BBB/
+host-applications/downloaded/
+qoe_work/
 host-applications/logs/
-host-applications/player_log.txt
+player_log.txt
+
+.vscode/

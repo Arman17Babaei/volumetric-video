@@ -28,11 +28,13 @@ def kill_flows(*hosts):
     """Kill any leftover iperf3 / ping flows on the given hosts."""
     for h in hosts:
         sh(h, "pkill -f iperf3 >/dev/null 2>&1 || true")
+        sh(h, "pkill -f 'python3 server.py' >/dev/null 2>&1 || true")
+        sh(h, "pkill -f 'python3 host-applications/client.py' >/dev/null 2>&1 || true")
         sh(h, "pkill -f 'ping -i' >/dev/null 2>&1 || true")
 
 
-def run_trial(h1, h2, bottleneck_node, bottleneck_dev: str,
-              mode_name: str, parallel: int = 4, seconds: int = 20):
+def run_iperf_trial(h1, h2, bottleneck_node, bottleneck_dev: str,
+              mode_name: str, parallel: int = 4, seconds: int = 5):
     """
     Run one experiment trial:
       - iperf3 from h1 -> h2
@@ -72,3 +74,18 @@ def run_trial(h1, h2, bottleneck_node, bottleneck_dev: str,
     info(f"*** {mode_name} sockets (h1):\n")
     ss_cmd = "ss -ti '( dport = :5201 )' | sed -n '1,8p'"
     info(sh(h1, ss_cmd))
+
+def run_trial(h1, h2, bottleneck_node, bottleneck_dev: str,
+              mode_name: str, parallel: int = 4, seconds: int = 5):
+    info("running\n")
+    kill_flows(h1, h2)
+
+    sh(h2, "cd host-applications && python3 server.py 8123 2>&1 > /tmp/server_log &")
+
+    sh(h1, f"python3 host-applications/run_client.py --runs 1 --srv_addr {IP_H2} 2>&1 > /tmp/client_log &")
+    info("waiting\n")
+    sleep(130)
+    info("info client\n")
+    info(sh(h1, 'cat /tmp/client_log'))
+    info("info server\n")
+    info(sh(h2, 'cat /tmp/server_log'))
