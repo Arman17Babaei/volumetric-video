@@ -129,7 +129,7 @@ def run_trial(clients, server, bottleneck_node, bottleneck_dev: str,
         info(f"*** Starting client{i} logging to {client_dir}\n")
         sh(client, f"cd host-applications && python3 run_client.py --runs 1 --srv_addr {server_ip} --log_dir ../{client_dir} 2>&1 > /tmp/client{i}_log &")
     
-    sleep_duration = 60
+    sleep_duration = 100
     info(f"*** Waiting for clients to complete ({sleep_duration}s)\n")
     sleep(sleep_duration)
     

@@ -19,3 +19,6 @@ player_log.txt
 plots/
 
 google-chrome-stable_current_amd64.deb
+aqm.json
+dualpi2_*.json
+*.p4i
