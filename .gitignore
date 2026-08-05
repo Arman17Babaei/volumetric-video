@@ -10,7 +10,12 @@ __pycache__/
 host-applications/BBB/
 host-applications/downloaded/
 qoe_work/
+experiments/
 host-applications/logs/
 player_log.txt
 
 .vscode/
+.venv/
+plots/
+
+google-chrome-stable_current_amd64.deb

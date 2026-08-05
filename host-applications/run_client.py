@@ -25,16 +25,20 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Modify JavaScript variables for DASH scenarios.")
     parser.add_argument('--runs', type=int, required=True, help="Specify the number of runs for each scenario.")
     parser.add_argument('--srv_addr', type=str, required=False, default='localhost', help="IP address of server")
+    parser.add_argument('--filename', type=str, required=False, default='player_log.txt', help="Output filename for player logs")
+    parser.add_argument('--log_dir', type=str, required=False, default='.', help="Directory to save log files")
     return parser.parse_args()
 
 # Function to run the player
-def runPlayer(playerURL, duration):
+def runPlayer(playerURL, duration, filename='player_log.txt', log_dir='.'):
     """
     Launch a headless Chrome browser to play a DASH video and log playback events.
 
     Args:
         playerURL (str): The URL of the player page.
         duration (int): Duration in seconds for monitoring playback.
+        filename (str): Output filename for player logs (default: 'player_log.txt').
+        log_dir (str): Directory to save log files (default: '.').
     """
     print("start player ", playerURL.split('/')[-1])
     d = DesiredCapabilities.CHROME
@@ -62,7 +66,11 @@ def runPlayer(playerURL, duration):
     
     driver.get(playerURL)
     
-    finame = f'player_log.txt'
+    # Ensure log directory exists
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Create full path for log file
+    finame = os.path.join(log_dir, filename)
     stop_players = False
     with open(finame, 'w') as f:
         # Wait until the player finishes or the max duration is reached or stop_players is triggered
@@ -95,6 +103,8 @@ def runPlayer(playerURL, duration):
 if __name__ == "__main__":
     runs = 1
     srv_addr = 'localhost'
+    filename = 'player_log.txt'
+    log_dir = '.'
 
     # Parse the command-line argument
     args = parse_args()
@@ -103,6 +113,10 @@ if __name__ == "__main__":
             runs = args.runs  # Get the number of runs from command-line input
         if args.srv_addr:
             srv_addr = args.srv_addr
+        if args.filename:
+            filename = args.filename
+        if args.log_dir:
+            log_dir = args.log_dir
     
     for i in range(runs):
         print(f"Run #{i + 1}/{runs}")
@@ -110,6 +124,6 @@ if __name__ == "__main__":
         
         # Start a process for the client with the assigned file
         # process = multiprocessing.Process(target=runPlayer, args=(f"file:///home/zenzi/Documents/LiveVMAF/client/index.html", duration_t))
-        process = multiprocessing.Process(target=runPlayer, args=(f"http://{srv_addr}:8123/index.html", duration_t))
+        process = multiprocessing.Process(target=runPlayer, args=(f"http://{srv_addr}:8123/index.html", duration_t, filename, log_dir))
         process.start()
         process.join()

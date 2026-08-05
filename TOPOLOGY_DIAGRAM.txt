@@ -1,0 +1,97 @@
+Multi-Client Network Topology Diagram
+=====================================
+
+Previous Single-Client Setup:
+-----------------------------
+┌────┐         ┌────┐         ┌────┐
+│ h1 │─────────│ s1 │─────────│ h2 │
+└────┘         └────┘         └────┘
+10.0.0.1     (switch)      10.0.0.2
+(client)                   (server)
+
+
+New Multi-Client Setup (N clients):
+-----------------------------------
+                     ┌────────┐
+            ┌────────│   h1   │ (10.0.0.1)
+            │        └────────┘
+            │        ┌────────┐
+            ├────────│   h2   │ (10.0.0.2)
+            │        └────────┘
+            │        ┌────────┐
+            ├────────│   h3   │ (10.0.0.3)
+            │        └────────┘
+┌────────┐  │           ...
+│   s1   │──┤        ┌────────┐
+│(switch)│  ├────────│   hN   │ (10.0.0.N)
+└────────┘  │        └────────┘
+            │
+            │  (Bottleneck applied here)
+            │        ┌────────┐
+            └────────│ server │ (10.0.0.{N+1})
+                     └────────┘
+
+
+Example with 3 Clients:
+-----------------------
+                     ┌────────┐
+            ┌────────│   h1   │ (10.0.0.1) ─┐
+            │        └────────┘              │
+            │                                │
+            │        ┌────────┐              ├─ Clients
+            ├────────│   h2   │ (10.0.0.2) ─┤
+┌────────┐  │        └────────┘              │
+│   s1   │──┤                                │
+│ (eth1) │  │        ┌────────┐              │
+│ (eth2) │  ├────────│   h3   │ (10.0.0.3) ─┘
+│ (eth3) │  │        └────────┘
+│ (eth4) │  │
+└────────┘  │  [Bottleneck: HTB + DualPI2/FIFO]
+            │        ┌────────┐
+            └────────│ server │ (10.0.0.4)
+             (eth4)  └────────┘
+
+
+Experiment Directory Structure:
+-------------------------------
+experiments/
+└── 20251231_HHMMSS_{mode}/
+    ├── experiment_config.json
+    ├── client1/
+    │   ├── player_log.txt
+    │   ├── qoe_metrics.json
+    │   └── qoe_work/
+    │       ├── segs/
+    │       ├── ssim/
+    │       └── vmaf/
+    ├── client2/
+    │   ├── player_log.txt
+    │   ├── qoe_metrics.json
+    │   └── qoe_work/
+    │       ├── segs/
+    │       ├── ssim/
+    │       └── vmaf/
+    └── client3/
+        ├── player_log.txt
+        ├── qoe_metrics.json
+        └── qoe_work/
+            ├── segs/
+            ├── ssim/
+            └── vmaf/
+
+
+Traffic Flow:
+------------
+All clients stream DASH video simultaneously from the server.
+They compete for bandwidth at the bottleneck (server link).
+
+h1 ─┐
+h2 ─┤
+h3 ─┼──> s1 ──[BOTTLENECK]──> server
+... ─┤
+hN ─┘
+
+Each client independently:
+1. Requests video segments from server
+2. Adapts bitrate based on network conditions
+3. Logs playback metrics to its own subdirectory
