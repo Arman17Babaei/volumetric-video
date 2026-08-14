@@ -6,6 +6,9 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("analysis", ROOT / "analyze_l4s_comparison.py")
 analysis = importlib.util.module_from_spec(spec); sys.modules[spec.name] = analysis; spec.loader.exec_module(analysis)
 
+runner_spec = importlib.util.spec_from_file_location("runner", ROOT / "run_l4s_comparison.py")
+runner = importlib.util.module_from_spec(runner_spec); sys.modules[runner_spec.name] = runner; runner_spec.loader.exec_module(runner)
+
 
 def test_schedule():
     assert analysis.planned_events(10) == [
@@ -55,3 +58,32 @@ def test_already_ce_is_not_new_mark():
     inc=P(1,"a","b",5201,1,1,1,"A",60,3)
     out=P(1.1,"a","b",5201,1,1,1,"A",60,3)
     assert not (inc.ecn==1 and out.ecn==3)
+
+
+def test_ss_data_connection_ignores_control_socket():
+    text = """ESTAB 0 0 10.0.0.1:40000 10.0.0.3:5201
+ cubic cwnd:10 rtt:2/1 bytes_sent:220 bytes_acked:200
+ESTAB 0 0 10.0.0.1:40002 10.0.0.3:5201
+ prague cwnd:42 rtt:40/2 bytes_sent:900000 bytes_acked:850000 retrans:0/1
+"""
+    row = runner.parse_ss_data_connection(text)
+    assert row["cwnd_bytes"] == 42 * 1460
+    assert row["bytes_sent"] == 900000
+
+
+def test_linux_native_queue_state_parser():
+    text = "prob 0.125000 delay_c 5000us delay_l 950us\n"
+    row = runner.parse_linux_queue_state(text)
+    assert row["queue_delay_us"] == 5000
+    assert row["delay_l_us"] == 950
+    assert row["base_probability"] == .125
+
+
+def test_p4_native_queue_state_parser():
+    text = """r_qdelay_c[3]= 0
+r_qdelay_l[3]= 1200
+r_probability[3]= 2147483648
+"""
+    row = runner.parse_p4_queue_state(text)
+    assert row["queue_delay_us"] == 1200
+    assert .49 < row["base_probability"] < .51

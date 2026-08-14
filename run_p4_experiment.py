@@ -74,6 +74,7 @@ DUALPI2_PARAMETER_ORDER = (
     "coupled_min_backlog_packets",
     "state_timeout_us",
     "idle_reset_us",
+    "export_qdelay_in_ipv4_id",
 )
 
 LINUX_MATCHED_DUALPI2_PROFILE: Dict[str, int] = {
@@ -91,6 +92,7 @@ LINUX_MATCHED_DUALPI2_PROFILE: Dict[str, int] = {
     "coupled_min_backlog_packets": 2,
     "state_timeout_us": 65_536,
     "idle_reset_us": 1_000_000,
+    "export_qdelay_in_ipv4_id": 0,
 }
 
 

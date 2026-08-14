@@ -1,0 +1,18 @@
+{
+  "linux": {
+    "matched_packets": 49298,
+    "packet_size_median_bytes": 1500.0,
+    "packet_size_max_bytes": 1500.0,
+    "queue_delay_median_ms": 3.1835,
+    "queue_delay_p99_ms": 22.42151000000001,
+    "new_ce_marks": 18920
+  },
+  "p4": {
+    "matched_packets": 46009,
+    "packet_size_median_bytes": 1500.0,
+    "packet_size_max_bytes": 1500.0,
+    "queue_delay_median_ms": 2.915,
+    "queue_delay_p99_ms": 17.043799999999976,
+    "new_ce_marks": 14629
+  }
+}

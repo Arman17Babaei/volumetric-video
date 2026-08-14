@@ -1,0 +1,42 @@
+{
+  "experiment": "linux-p4-l4s-behavioral-comparison",
+  "schedule": [
+    [
+      0,
+      "start",
+      "A"
+    ],
+    [
+      8.0,
+      "start",
+      "B"
+    ],
+    [
+      16.0,
+      "stop",
+      "A"
+    ],
+    [
+      24.0,
+      "start",
+      "A"
+    ],
+    [
+      32.0,
+      "stop",
+      "B"
+    ],
+    [
+      40.0,
+      "stop",
+      "A"
+    ]
+  ],
+  "rate_mbit": 3.0,
+  "delay_ms": 20.0,
+  "phase_seconds": 8.0,
+  "l4s_step_us": 5000,
+  "mtu_bytes": 1500,
+  "p4_rate_scale": 1.0,
+  "repetitions": 5
+}

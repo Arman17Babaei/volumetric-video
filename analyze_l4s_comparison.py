@@ -31,6 +31,7 @@ class Packet:
     flags: str
     ip_len: int
     ecn: int
+    ip_id: int = 0
 
     @property
     def flow(self) -> str:
@@ -92,6 +93,7 @@ def _tshark_rows(path: Path) -> Iterator[Packet]:
     fields = [
         "frame.time_epoch", "ip.src", "ip.dst", "tcp.srcport", "tcp.dstport",
         "tcp.seq_raw", "tcp.ack_raw", "tcp.flags.str", "ip.len", "ip.dsfield.ecn",
+        "ip.id",
     ]
 
     cmd = [
@@ -136,6 +138,7 @@ def _tshark_rows(path: Path) -> Iterator[Packet]:
                 flags=parts[7],
                 ip_len=int(parts[8]),
                 ecn=int(parts[9], 0) if parts[9] else 0,
+                ip_id=int(parts[10], 0) if parts[10] else 0,
             )
         except ValueError:
             continue
@@ -230,9 +233,9 @@ def write_packet_matches(rep_dir: Path, backend: str, rep: int, analysis_dir: Pa
         rows.append({
             "backend": backend, "rep": rep, "time_s": inc.ts - t0,
             "flow": inc.flow, "ip_len": inc.ip_len, "residence_us": residence,
-            "queue_delay_us": corrected_queue_delay_us(residence, baseline),
             "ecn_in": inc.ecn, "ecn_out": out.ecn,
             "ce_marked": int(inc.ecn == 1 and out.ecn == 3),
+            "p4_queue_delay_us": out.ip_id if backend == "p4" else "",
         })
     return rows
 
@@ -252,7 +255,15 @@ def _load_transport(path: Path) -> List[Dict[str, float | str]]:
                 except ValueError:
                     parsed[key] = value
             rows.append(parsed)
-        return rows
+    return rows
+
+
+def _load_numeric_csv(path: Path) -> List[Dict[str, float]]:
+    if not path.exists():
+        return []
+    with path.open(newline="") as stream:
+        return [{key: float(value) for key, value in row.items() if value not in (None, "")}
+                for row in csv.DictReader(stream)]
 
 
 def analyze_root(root: Path, bin_ms: float = 250.0) -> Path:
@@ -260,6 +271,7 @@ def analyze_root(root: Path, bin_ms: float = 250.0) -> Path:
     analysis_dir.mkdir(parents=True, exist_ok=True)
     packet_rows: List[Dict[str, float]] = []
     transport_rows: List[Dict[str, float | str]] = []
+    queue_rows: List[Dict[str, float | str]] = []
     for backend in ("linux", "p4"):
         parent = root / backend
         if not parent.exists():
@@ -270,6 +282,9 @@ def analyze_root(root: Path, bin_ms: float = 250.0) -> Path:
             for row in _load_transport(rep_dir / "transport.csv"):
                 row["backend"] = backend; row["rep"] = float(rep)
                 transport_rows.append(row)
+            for row in _load_numeric_csv(rep_dir / "queue.csv"):
+                row["backend"] = backend; row["rep"] = float(rep)
+                queue_rows.append(row)
 
     if not packet_rows:
         raise SystemExit("no packet matches found")
@@ -279,29 +294,56 @@ def analyze_root(root: Path, bin_ms: float = 250.0) -> Path:
         writer = csv.DictWriter(stream, fieldnames=list(packet_rows[0].keys()))
         writer.writeheader(); writer.writerows(packet_rows)
 
-    curve_rows = []
-    for backend in sorted(set(row["backend"] for row in packet_rows)):
-        curve = marking_curve([r for r in packet_rows if r["backend"] == backend], min_samples=20)
-        for row in curve:
-            curve_rows.append({"backend": backend, **row})
-    with (analysis_dir / "marking_curve.csv").open("w", newline="") as stream:
-        fields = ["backend", "queue_delay_ms", "ce_probability", "samples"]
-        writer = csv.DictWriter(stream, fieldnames=fields); writer.writeheader(); writer.writerows(curve_rows)
+    for row in packet_rows:
+        if row["backend"] == "p4" and row.get("p4_queue_delay_us") not in (None, ""):
+            queue_rows.append({
+                "backend": "p4", "rep": row["rep"], "time_s": row["time_s"],
+                "queue_delay_us": row["p4_queue_delay_us"],
+            })
+    if not queue_rows:
+        raise SystemExit("no backend-native queue-delay samples found; old pcap residence times are not queue delay")
+    with (analysis_dir / "queue_samples.csv").open("w", newline="") as stream:
+        fields = ["backend", "rep", "time_s", "queue_delay_us", "delay_c_us",
+                  "delay_l_us", "base_probability"]
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader(); writer.writerows(queue_rows)
 
     summary = {}
     for backend in sorted(set(row["backend"] for row in packet_rows)):
         subset = [r for r in packet_rows if r["backend"] == backend]
-        delays = [r["queue_delay_us"] / 1000.0 for r in subset]
+        delays = [float(r["queue_delay_us"]) / 1000.0 for r in queue_rows
+                  if r["backend"] == backend]
+        lengths = [float(r["ip_len"]) for r in subset]
         summary[backend] = {
             "matched_packets": len(subset),
+            "packet_size_median_bytes": statistics.median(lengths),
+            "packet_size_max_bytes": max(lengths),
             "queue_delay_median_ms": statistics.median(delays),
             "queue_delay_p99_ms": quantile(delays, 0.99),
             "new_ce_marks": sum(int(r["ce_marked"]) for r in subset),
         }
     (analysis_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
+    phase_seconds = 10.0
+    target_mbit = 10.0
+    manifest = root / "manifest.json"
+    if manifest.exists():
+        manifest_data = json.loads(manifest.read_text())
+        phase_seconds = float(manifest_data.get("phase_seconds", phase_seconds))
+        target_mbit = float(manifest_data.get("rate_mbit", target_mbit))
+        # Older manifests only record the schedule.
+        schedule = manifest_data.get("schedule", [])
+        if schedule and len(schedule) > 1:
+            phase_seconds = float(schedule[1][0])
+
+    validation = validation_metrics(packet_rows, queue_rows, transport_rows,
+                                    phase_seconds, target_mbit)
+    (analysis_dir / "validation.json").write_text(
+        json.dumps(validation, indent=2) + "\n")
+
     try:
-        render_figure(packet_rows, transport_rows, curve_rows, analysis_dir, bin_ms / 1000.0)
+        render_figure(packet_rows, transport_rows, queue_rows, analysis_dir,
+                      bin_ms / 1000.0, phase_seconds, target_mbit)
     except ImportError:
         pass
     return analysis_dir
@@ -318,75 +360,210 @@ def _aggregate_series(series_by_rep: Dict[int, Dict[int, float]], width_s: float
     return xs,med,q1,q3
 
 
-def render_figure(packet_rows, transport_rows, curve_rows, analysis_dir: Path, width_s: float) -> None:
-    import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.0))
-    phase_lines = [10, 20, 30, 40]
-
-    # (a) IP wire goodput from matched packets, aggregated per repetition.
-    ax = axes[0, 0]
+def validation_metrics(packet_rows, queue_rows, transport_rows,
+                       phase_seconds: float, target_mbit: float) -> Dict[str, object]:
+    """Compute explicit gates before claiming Linux/P4 behavioral parity."""
+    margin = min(1.0, phase_seconds * .15)
+    phases = [(i*phase_seconds+margin, (i+1)*phase_seconds-margin) for i in range(5)]
+    result: Dict[str, object] = {"target_mbit_s": target_mbit, "backends": {}}
     for backend in ("linux", "p4"):
-        for flow in ("A", "B"):
-            by_rep: Dict[int, Dict[int,float]]={}
-            reps=sorted({int(r["rep"]) for r in packet_rows if r["backend"]==backend and r["flow"]==flow})
-            for rep in reps:
-                bins=time_bin([(float(r["time_s"]), float(r["ip_len"])*8/1e6)
-                               for r in packet_rows if r["backend"]==backend and r["flow"]==flow and int(r["rep"])==rep], width_s)
-                by_rep[rep]={i:sum(v)/width_s for i,v in bins.items()}
-            xs,med,q1,q3=_aggregate_series(by_rep,width_s)
-            if xs:
-                line="-" if backend=="linux" else "--"
-                ax.plot(xs,med,linestyle=line,label=f"{flow} {backend}")
-                ax.fill_between(xs,q1,q3,alpha=.10)
-    ax.set_title("(a) Per-flow wire goodput"); ax.set_ylabel("Mbit/s"); ax.set_xlabel("Time (s)")
+        rows = [r for r in packet_rows if r["backend"] == backend]
+        reps = sorted({int(r["rep"]) for r in rows})
+        phase_goodput = []
+        solo_ce, dual_ce = [], []
+        for rep in reps:
+            for phase, (lo, hi) in enumerate(phases):
+                samples = [r for r in rows if int(r["rep"]) == rep
+                           and lo <= float(r["time_s"]) < hi]
+                phase_goodput.append(
+                    sum(float(r["ip_len"]) * 8 / 1e6 for r in samples) / (hi-lo))
+                ect1 = [r for r in samples if int(float(r["ecn_in"])) == 1]
+                if ect1:
+                    fraction = sum(int(float(r["ce_marked"])) for r in ect1) / len(ect1)
+                    (dual_ce if phase in (1, 3) else solo_ce).append(fraction)
+        qdelay = [float(r["queue_delay_us"])/1000 for r in queue_rows
+                  if r["backend"] == backend]
+        cwnd_solo, cwnd_dual = [], []
+        for row in transport_rows:
+            if row.get("backend") != backend or "cwnd_bytes" not in row:
+                continue
+            t = float(row["time_s"])
+            for phase, (lo, hi) in enumerate(phases):
+                if lo <= t < hi:
+                    (cwnd_dual if phase in (1, 3) else cwnd_solo).append(
+                        float(row["cwnd_bytes"])/1024)
+                    break
+        result["backends"][backend] = {
+            "repetitions": len(reps),
+            "max_packet_bytes": max(float(r["ip_len"]) for r in rows),
+            "phase_goodput_median_mbit_s": statistics.median(phase_goodput),
+            "queue_delay_median_ms": statistics.median(qdelay),
+            "queue_delay_p99_ms": quantile(qdelay, .99),
+            "solo_ce_fraction": statistics.median(solo_ce),
+            "dual_flow_ce_fraction": statistics.median(dual_ce),
+            "solo_cwnd_median_kib": statistics.median(cwnd_solo),
+            "dual_flow_cwnd_median_kib": statistics.median(cwnd_dual),
+        }
+    linux = result["backends"]["linux"]
+    p4 = result["backends"]["p4"]
+    relative_gap = lambda a, b: abs(a-b) / max(abs(a), abs(b), 1e-12)
+    gates = {
+        "five_repetitions_each": linux["repetitions"] >= 5 and p4["repetitions"] >= 5,
+        "mtu_1500_or_less": linux["max_packet_bytes"] <= 1500 and p4["max_packet_bytes"] <= 1500,
+        "linux_goodput_within_10pct_of_target": abs(linux["phase_goodput_median_mbit_s"]-target_mbit)/target_mbit <= .10,
+        "p4_goodput_within_10pct_of_target": abs(p4["phase_goodput_median_mbit_s"]-target_mbit)/target_mbit <= .10,
+        "backend_goodput_gap_at_most_10pct": relative_gap(linux["phase_goodput_median_mbit_s"], p4["phase_goodput_median_mbit_s"]) <= .10,
+        "median_queue_delay_gap_at_most_25pct": relative_gap(linux["queue_delay_median_ms"], p4["queue_delay_median_ms"]) <= .25,
+        "solo_ce_gap_at_most_0_10": abs(linux["solo_ce_fraction"]-p4["solo_ce_fraction"]) <= .10,
+        "dual_ce_gap_at_most_0_10": abs(linux["dual_flow_ce_fraction"]-p4["dual_flow_ce_fraction"]) <= .10,
+        "cwnd_falls_with_competition_linux": linux["dual_flow_cwnd_median_kib"] < linux["solo_cwnd_median_kib"],
+        "cwnd_falls_with_competition_p4": p4["dual_flow_cwnd_median_kib"] < p4["solo_cwnd_median_kib"],
+    }
+    result["gates"] = gates
+    result["overall_pass"] = all(gates.values())
+    return result
 
-    # (b) packet residence minus backend/repetition low-delay baseline.
+
+def _packet_metric_by_rep(packet_rows, backend: str, width_s: float, metric: str,
+                          flow: str | None = None):
+    """Return a per-repetition binned behavioral metric."""
+    result: Dict[int, Dict[int, float]] = {}
+    reps = sorted({int(r["rep"]) for r in packet_rows if r["backend"] == backend})
+    for rep in reps:
+        rows = [r for r in packet_rows
+                if r["backend"] == backend and int(r["rep"]) == rep
+                and (flow is None or r["flow"] == flow)]
+        bins: Dict[int, List[Mapping[str, float]]] = defaultdict(list)
+        for row in rows:
+            index = int(math.floor(float(row["time_s"]) / width_s))
+            if index >= 0:
+                bins[index].append(row)
+        values: Dict[int, float] = {}
+        for index, samples in bins.items():
+            if metric == "goodput_mbit_s":
+                values[index] = sum(float(r["ip_len"]) * 8 / 1e6 for r in samples) / width_s
+            elif metric == "flow_a_share":
+                total = sum(float(r["ip_len"]) for r in samples)
+                values[index] = (sum(float(r["ip_len"]) for r in samples if r["flow"] == "A") / total
+                                 if total else math.nan)
+            elif metric == "ce_fraction":
+                ect1 = [r for r in samples if int(float(r["ecn_in"])) == 1]
+                if ect1:
+                    values[index] = sum(int(float(r["ce_marked"])) for r in ect1) / len(ect1)
+            else:
+                raise ValueError(f"unknown metric: {metric}")
+        result[rep] = values
+    return result
+
+
+def _sample_metric_by_rep(rows, backend: str, width_s: float, key: str,
+                          scale: float = 1.0, flow: str | None = None):
+    result = {}
+    reps = sorted({int(float(r["rep"])) for r in rows if r.get("backend") == backend})
+    for rep in reps:
+        values = [(float(r["time_s"]), float(r[key]) * scale) for r in rows
+                  if r.get("backend") == backend and int(float(r["rep"])) == rep
+                  and key in r and (flow is None or r.get("flow") == flow)]
+        bins = time_bin(values, width_s)
+        result[rep] = {index: statistics.median(samples) for index, samples in bins.items()}
+    return result
+
+
+def render_figure(packet_rows, transport_rows, queue_rows, analysis_dir: Path,
+                  width_s: float, phase_seconds: float = 10.0,
+                  target_mbit: float = 10.0) -> None:
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(2, 2, figsize=(11.0, 7.3), sharex=True)
+    backend_colors = {"linux": "#1f77b4", "p4": "#d95f02"}
+    flow_colors = {"A": "#3366a6", "B": "#c44e52"}
+    backend_labels = {"linux": "Linux DualPI2", "p4": "P4/BMv2"}
+    linestyles = {"linux": "-", "p4": "--"}
+
+    # (a) Absolute per-flow goodput. Matching the configured-rate envelopes is
+    # a gate, not something to normalize away.
+    ax = axes[0, 0]
+    for flow in ("A", "B"):
+        for backend in ("linux", "p4"):
+            series = _packet_metric_by_rep(packet_rows, backend, width_s,
+                                           "goodput_mbit_s", flow)
+            xs, med, q1, q3 = _aggregate_series(series, width_s)
+            label = f"Flow {flow}, {backend_labels[backend]}"
+            ax.plot(xs, med, color=flow_colors[flow], linestyle=linestyles[backend],
+                    linewidth=1.6, label=label)
+            ax.fill_between(xs, q1, q3, color=flow_colors[flow], alpha=.08, linewidth=0)
+    ax.set_title("(a) Per-flow goodput", loc="left", fontsize=11)
+    ax.set_ylabel("Mbit/s")
+    ax.set_ylim(bottom=0)
+
+    # (b) Backend-native AQM queue-delay estimate: tc DualPI2 delay_l/c for
+    # Linux and BMv2 deq_timedelta registers for P4.
     ax = axes[0, 1]
     for backend in ("linux", "p4"):
-        by_rep_med: Dict[int,Dict[int,float]]={}; by_rep_p99: Dict[int,Dict[int,float]]={}
-        reps=sorted({int(r["rep"]) for r in packet_rows if r["backend"]==backend})
-        for rep in reps:
-            vals=[(float(r["time_s"]),float(r["queue_delay_us"])/1000.0)
-                  for r in packet_rows if r["backend"]==backend and int(r["rep"])==rep]
-            bins=time_bin(vals,width_s)
-            by_rep_med[rep]={i:statistics.median(v) for i,v in bins.items()}
-            by_rep_p99[rep]={i:quantile(v,.99) for i,v in bins.items()}
-        xs,med,_,_=_aggregate_series(by_rep_med,width_s)
-        xp,p99,_,_=_aggregate_series(by_rep_p99,width_s)
-        ax.plot(xs,med,linestyle="-" if backend=="linux" else "--",label=f"{backend} median")
-        ax.plot(xp,p99,linestyle=":" if backend=="linux" else "-.",label=f"{backend} p99")
-    ax.set_title("(b) Queue delay"); ax.set_ylabel("ms"); ax.set_xlabel("Time (s)")
+        series = _sample_metric_by_rep(queue_rows, backend, width_s,
+                                       "queue_delay_us", 1/1000)
+        xs, med, q1, q3 = _aggregate_series(series, width_s)
+        ax.plot(xs, med, color=backend_colors[backend], linewidth=1.7,
+                label=backend_labels[backend])
+        ax.fill_between(xs, q1, q3, color=backend_colors[backend], alpha=.14, linewidth=0)
+    ax.set_title("(b) AQM queue delay", loc="left", fontsize=11)
+    ax.set_ylabel("ms")
+    ax.set_ylim(bottom=0)
 
-    # (c) empirical probability that an entering ECT(1) packet exits CE.
+    # (c) CE behavior over time; no residence-time-derived x-axis.
     ax = axes[1, 0]
     for backend in ("linux", "p4"):
-        rows=[r for r in curve_rows if r["backend"]==backend]
-        ax.plot([r["queue_delay_ms"] for r in rows],[r["ce_probability"] for r in rows],
-                linestyle="-" if backend=="linux" else "--",label=backend)
-    ax.set_title("(c) Empirical CE marking"); ax.set_xlabel("Queue delay (ms)"); ax.set_ylabel("P(new CE)"); ax.set_ylim(-.02,1.02)
+        series = _packet_metric_by_rep(packet_rows, backend, width_s, "ce_fraction")
+        xs, med, q1, q3 = _aggregate_series(series, width_s)
+        ax.plot(xs, med, color=backend_colors[backend], linewidth=1.7,
+                label=backend_labels[backend])
+        ax.fill_between(xs, q1, q3, color=backend_colors[backend], alpha=.14, linewidth=0)
+    ax.set_title("(c) New CE-mark fraction", loc="left", fontsize=11)
+    ax.set_ylabel("fraction of entering ECT(1)")
+    ax.set_ylim(0, 1)
 
-    # (d) sender cwnd, median and IQR over repetitions in 250 ms bins.
+    # (d) Data-socket congestion windows only.
     ax = axes[1, 1]
-    for backend in ("linux","p4"):
-        for flow in ("A","B"):
-            reps=sorted({int(float(r["rep"])) for r in transport_rows if r.get("backend")==backend and r.get("flow")==flow and "cwnd_bytes" in r})
-            by_rep={}
-            for rep in reps:
-                vals=[(float(r["time_s"]),float(r["cwnd_bytes"])/1024.0)
-                      for r in transport_rows if r.get("backend")==backend and r.get("flow")==flow and int(float(r["rep"]))==rep and "cwnd_bytes" in r]
-                bins=time_bin(vals,width_s)
-                by_rep[rep]={i:statistics.median(v) for i,v in bins.items()}
-            xs,med,q1,q3=_aggregate_series(by_rep,width_s)
-            if xs:
-                ax.plot(xs,med,linestyle="-" if backend=="linux" else "--",label=f"{flow} {backend}")
-                ax.fill_between(xs,q1,q3,alpha=.10)
-    ax.set_title("(d) Prague congestion window"); ax.set_xlabel("Time (s)"); ax.set_ylabel("KiB")
+    for flow in ("A", "B"):
+        for backend in ("linux", "p4"):
+            series = _sample_metric_by_rep(transport_rows, backend, width_s,
+                                            "cwnd_bytes", 1/1024, flow)
+            xs, med, q1, q3 = _aggregate_series(series, width_s)
+            ax.plot(xs, med, color=flow_colors[flow], linestyle=linestyles[backend],
+                    linewidth=1.6, label=f"Flow {flow}, {backend_labels[backend]}")
+            ax.fill_between(xs, q1, q3, color=flow_colors[flow], alpha=.08, linewidth=0)
+    ax.set_title("(d) Prague data-socket congestion window", loc="left", fontsize=11)
+    ax.set_ylabel("KiB")
+    ax.set_ylim(bottom=0)
 
-    for ax in (axes[0,0],axes[0,1],axes[1,1]):
-        for x in phase_lines: ax.axvline(x,linewidth=.7,alpha=.35)
+    total_seconds = 5 * phase_seconds
+    phase_names = ("A only", "A + B", "B only", "A + B", "A only")
     for ax in axes.flat:
-        ax.grid(alpha=.2); ax.legend(fontsize=7)
-    fig.tight_layout()
+        for phase in range(5):
+            lo, hi = phase*phase_seconds, (phase+1)*phase_seconds
+            if phase % 2:
+                ax.axvspan(lo, hi, color="0.5", alpha=.06, linewidth=0)
+            if phase:
+                ax.axvline(lo, color="0.4", linewidth=.7, alpha=.45)
+        ax.set_xlim(0, total_seconds)
+        ax.set_xlabel("Time (s)")
+        ax.grid(axis="y", alpha=.22)
+    for phase, name in enumerate(phase_names):
+        axes[0, 0].text((phase+.5)*phase_seconds, .965, name,
+                        transform=axes[0, 0].get_xaxis_transform(), ha="center",
+                        va="top", fontsize=7.5, color="0.3",
+                        bbox={"facecolor": "white", "edgecolor": "none", "alpha": .7, "pad": 1})
+
+    axes[0, 0].legend(fontsize=7, ncol=2)
+    axes[0, 1].legend(fontsize=8)
+    axes[1, 0].legend(fontsize=8)
+    axes[1, 1].legend(fontsize=7, ncol=2)
+    reps = {backend: len({int(r["rep"]) for r in packet_rows if r["backend"] == backend})
+            for backend in ("linux", "p4")}
+    fig.suptitle("L4S implementation validation: Linux DualPI2 vs P4/BMv2\n"
+                 f"{target_mbit:g} Mbit/s bottleneck; median and IQR over "
+                 f"{reps['linux']} Linux and {reps['p4']} P4 runs",
+                 fontsize=13, y=1.055)
+    fig.tight_layout(rect=(0, 0, 1, .965))
     for ext in ("pdf","svg","png"):
         fig.savefig(analysis_dir/f"comparison.{ext}",dpi=300,bbox_inches="tight")
     plt.close(fig)

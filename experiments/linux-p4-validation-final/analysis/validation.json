@@ -1,0 +1,40 @@
+{
+  "target_mbit_s": 3.0,
+  "backends": {
+    "linux": {
+      "repetitions": 5,
+      "max_packet_bytes": 1500.0,
+      "phase_goodput_median_mbit_s": 2.9575360000000384,
+      "queue_delay_median_ms": 3.1835,
+      "queue_delay_p99_ms": 22.42151000000001,
+      "solo_ce_fraction": 0.34854497354497355,
+      "dual_flow_ce_fraction": 0.45516325354223286,
+      "solo_cwnd_median_kib": 17.109375,
+      "dual_flow_cwnd_median_kib": 8.5546875
+    },
+    "p4": {
+      "repetitions": 5,
+      "max_packet_bytes": 1500.0,
+      "phase_goodput_median_mbit_s": 2.826000000000033,
+      "queue_delay_median_ms": 2.915,
+      "queue_delay_p99_ms": 17.043799999999976,
+      "solo_ce_fraction": 0.277577505407354,
+      "dual_flow_ce_fraction": 0.3877413342375112,
+      "solo_cwnd_median_kib": 19.9609375,
+      "dual_flow_cwnd_median_kib": 9.98046875
+    }
+  },
+  "gates": {
+    "five_repetitions_each": true,
+    "mtu_1500_or_less": true,
+    "linux_goodput_within_10pct_of_target": true,
+    "p4_goodput_within_10pct_of_target": true,
+    "backend_goodput_gap_at_most_10pct": true,
+    "median_queue_delay_gap_at_most_25pct": true,
+    "solo_ce_gap_at_most_0_10": true,
+    "dual_ce_gap_at_most_0_10": true,
+    "cwnd_falls_with_competition_linux": true,
+    "cwnd_falls_with_competition_p4": true
+  },
+  "overall_pass": true
+}

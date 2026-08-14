@@ -342,7 +342,8 @@ control MyEgress(inout headers hdr,
                    bit<19> l4s_min_queue_pkts,
                    bit<19> coupled_min_backlog_pkts,
                    bit<32> state_timeout_us,
-                   bit<32> idle_reset_us) {
+                   bit<32> idle_reset_us,
+                   flag_t export_qdelay_in_ipv4_id) {
 
         /**********************
          * 0. Local variables
@@ -394,6 +395,17 @@ control MyEgress(inout headers hdr,
             qdelay_now = 2147483647;
         } else {
             qdelay_now = (int<32>) standard_metadata.deq_timedelta;
+        }
+
+        /*
+         * Validation-only telemetry. The comparison runner enables this to
+         * export the exact BMv2 queue sojourn carried by each egress packet.
+         * Normal experiments leave it disabled and preserve IPv4 ID.
+         */
+        if (export_qdelay_in_ipv4_id == 1w1) {
+            hdr.ipv4.identification =
+                (qdelay_now > 65535) ? 16w0xFFFF :
+                (bit<16>) (bit<32>) qdelay_now;
         }
 
         /**********************
@@ -724,7 +736,8 @@ control MyEgress(inout headers hdr,
             DEFAULT_L4S_MIN_QUEUE_PKTS,
             DEFAULT_COUPLED_MIN_BACKLOG_PKTS,
             DEFAULT_STATE_TIMEOUT_US,
-            DEFAULT_IDLE_RESET_US);
+            DEFAULT_IDLE_RESET_US,
+            1w0);
     }
 
     apply {

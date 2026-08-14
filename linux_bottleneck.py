@@ -202,6 +202,7 @@ def set_bottleneck_dualpi2(
     s2_to_s1_device: str,
     *,
     rate_mbit: float = BW_MBIT,
+    l4s_step_us: int = 1000,
 ) -> None:
     """Install symmetric HTB + DualPI2 on the inter-switch link."""
     s1.cmd("modprobe sch_dualpi2 >/dev/null 2>&1 || true")
@@ -209,6 +210,7 @@ def set_bottleneck_dualpi2(
 
     child = (
         f"dualpi2 target {DUALPI2_TARGET} "
+        f"step_thresh {int(l4s_step_us)}us "
         f"limit {DUALPI2_LIMIT_PACKETS}"
     )
     _replace_root_qdisc(

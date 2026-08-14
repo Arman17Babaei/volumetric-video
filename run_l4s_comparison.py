@@ -84,6 +84,74 @@ def parse_ss(text: str, mss: int = 1460) -> Dict[str, float]:
     return values
 
 
+def parse_ss_data_connection(text: str) -> Dict[str, float]:
+    """Select iperf's bulk-data socket, not its small control socket."""
+    connections: List[str] = []
+    current: List[str] = []
+    for line in text.splitlines():
+        if line and not line[0].isspace():
+            if current:
+                connections.append("\n".join(current))
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        connections.append("\n".join(current))
+    parsed = [parse_ss(connection) for connection in connections]
+    candidates = [row for row in parsed if row]
+    return max(candidates, key=lambda row: row.get("bytes_sent", 0.0), default={})
+
+
+def configure_experiment_interfaces(nodes, mtu: int = 1500) -> None:
+    """Give Linux and P4 runs identical MTUs and packet-level captures.
+
+    P4-Utils otherwise creates 9500-byte interfaces. BMv2 shapes packets/s,
+    so that silently turns a queue configured for 1500-byte packets into a
+    roughly 63 Mbit/s queue. Disabling host offloads also prevents captures
+    from observing synthetic GSO packets that never enter the AQM as such.
+    """
+    for node in nodes:
+        for intf in node.intfList():
+            if intf.name == "lo":
+                continue
+            result = node.cmd(f"ip link set dev {intf.name} mtu {int(mtu)} 2>&1")
+            if result.strip():
+                raise RuntimeError(f"failed to set MTU on {node.name}/{intf.name}: {result}")
+            node.cmd(
+                f"ethtool -K {intf.name} tso off gso off gro off lro off "
+                "2>/dev/null || true"
+            )
+
+
+def parse_linux_queue_state(text: str) -> Dict[str, float]:
+    result: Dict[str, float] = {}
+    for name in ("delay_c", "delay_l"):
+        match = re.search(rf"\b{name}\s+(\d+)us\b", text)
+        if match:
+            result[f"{name}_us"] = float(match.group(1))
+    match = re.search(r"\bprob\s+([0-9.]+)", text)
+    if match:
+        result["base_probability"] = float(match.group(1))
+    if "delay_c_us" in result or "delay_l_us" in result:
+        result["queue_delay_us"] = max(result.get("delay_c_us", 0), result.get("delay_l_us", 0))
+    return result
+
+
+def parse_p4_queue_state(text: str) -> Dict[str, float]:
+    result: Dict[str, float] = {}
+    names = {"r_qdelay_c": "delay_c_us", "r_qdelay_l": "delay_l_us"}
+    for register, name in names.items():
+        match = re.search(rf"\b{register}\[\d+\]\s*=\s*(-?\d+)", text)
+        if match:
+            result[name] = max(0.0, float(match.group(1)))
+    match = re.search(r"\br_probability\[\d+\]\s*=\s*(\d+)", text)
+    if match:
+        result["base_probability"] = float(match.group(1)) / 0xFFFFFFFF
+    if "delay_c_us" in result or "delay_l_us" in result:
+        result["queue_delay_us"] = max(result.get("delay_c_us", 0), result.get("delay_l_us", 0))
+    return result
+
+
 def transport_sampler(hosts: Dict[str, object], started: float, stop_event: threading.Event,
                       output: Path, sample_ms: float, generation: Dict[str, int]) -> None:
     with output.open("w", newline="") as stream:
@@ -94,12 +162,27 @@ def transport_sampler(hosts: Dict[str, object], started: float, stop_event: thre
             now = time.monotonic()
             for flow, host in hosts.items():
                 port = FLOW_PORTS[flow]
-                text = host.cmd(f"ss -tin '( dport = :{port} )' 2>/dev/null")
-                data = parse_ss(text)
+                text = host.cmd(f"ss -tinH state established '( dport = :{port} )' 2>/dev/null")
+                data = parse_ss_data_connection(text)
                 if data:
                     row = {"time_s": now-started, "flow": flow,
                            "connection_generation": generation[flow], **data}
                     writer.writerow(row); stream.flush()
+            stop_event.wait(sample_ms/1000.0)
+
+
+def queue_sampler(sample, started: float, stop_event: threading.Event,
+                  output: Path, sample_ms: float) -> None:
+    fields = ["time_s", "queue_delay_us", "delay_c_us", "delay_l_us", "base_probability"]
+    with output.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        while not stop_event.is_set():
+            now = time.monotonic()
+            data = sample()
+            if data:
+                writer.writerow({"time_s": now-started, **data})
+                stream.flush()
             stop_event.wait(sample_ms/1000.0)
 
 
@@ -111,16 +194,19 @@ def record_environment(path: Path, backend: str, args, p4src: Optional[Path] = N
         "tshark_version": run_local(["tshark", "--version"]).splitlines()[:1],
         "phase_seconds": args.phase_seconds, "sample_ms": args.sample_ms,
         "configured_rate_mbit": args.rate_mbit, "configured_delay_ms": args.delay_ms,
+        "l4s_step_us": args.l4s_step_us, "mtu_bytes": 1500,
     }
     if p4src:
         meta["p4"] = {"source": str(p4src), "sha256": sha256_file(p4src),
                       "simple_switch_version": run_local(["simple_switch", "--version"]),
-                      "p4c_version": run_local(["p4c", "--version"])}
+                      "p4c_version": run_local(["p4c", "--version"]),
+                      "queue_rate_scale": args.p4_rate_scale}
     path.write_text(json.dumps(meta, indent=2)+"\n")
 
 
 def run_phases(clients, server, rep_dir: Path, phase_seconds: float, sample_ms: float,
-               ingress_devices: Tuple[str, str], egress_node, egress_device: str) -> None:
+               ingress_devices: Tuple[str, str], egress_node, egress_device: str,
+               sample_queue) -> None:
     rep_dir.mkdir(parents=True, exist_ok=False)
     for host in clients + [server]: ensure_prague(host)
     for port in FLOW_PORTS.values():
@@ -136,7 +222,9 @@ def run_phases(clients, server, rep_dir: Path, phase_seconds: float, sample_ms: 
     generations = {"A":0,"B":0}
     sampler = threading.Thread(target=transport_sampler,
         args=({"A":clients[0],"B":clients[1]}, started, stop_sample, rep_dir/"transport.csv", sample_ms, generations), daemon=True)
-    sampler.start()
+    queue_thread = threading.Thread(target=queue_sampler,
+        args=(sample_queue, started, stop_sample, rep_dir/"queue.csv", sample_ms), daemon=True)
+    sampler.start(); queue_thread.start()
     events = []
     try:
         for planned, action, flow in phase_schedule(phase_seconds):
@@ -161,7 +249,7 @@ def run_phases(clients, server, rep_dir: Path, phase_seconds: float, sample_ms: 
     finally:
         for proc in procs.values():
             if proc.poll() is None: proc.kill()
-        stop_sample.set(); sampler.join(timeout=2)
+        stop_sample.set(); sampler.join(timeout=2); queue_thread.join(timeout=2)
         for proc in captures:
             if proc.poll() is None: proc.send_signal(signal.SIGINT)
         for proc in captures:
@@ -180,16 +268,21 @@ def run_linux(args, root: Path) -> None:
     net, clients, server, s1, s2 = build_linux_net(num_clients=2)
     s1s2, s2s1 = get_interswitch_devices(2)
     try:
+        configure_experiment_interfaces([*clients, server, s1, s2])
         clear_all_qdisc(s1, s2, server, *clients)
         add_access_delays(args.delay_ms, server, *clients)
-        set_bottleneck_dualpi2(s1, s1s2, s2, s2s1, rate_mbit=args.rate_mbit)
+        set_bottleneck_dualpi2(s1, s1s2, s2, s2s1,
+                               rate_mbit=args.rate_mbit,
+                               l4s_step_us=args.l4s_step_us)
         parent = root/"linux"; parent.mkdir(parents=True)
         record_environment(parent/"metadata.json", "linux", args)
         for rep in range(1, args.repetitions+1):
             rep_dir = parent/f"rep_{rep:02d}"
             qdisc_before = s1.cmd(f"tc -details -statistics qdisc show dev {s1s2}")
+            sample_queue = lambda: parse_linux_queue_state(
+                s1.cmd(f"tc -details -statistics qdisc show dev {s1s2}"))
             run_phases(clients, server, rep_dir, args.phase_seconds, args.sample_ms,
-                       ("h1-eth0","h2-eth0"), s1, s1s2)
+                       ("h1-eth0","h2-eth0"), s1, s1s2, sample_queue)
             (rep_dir/"qdisc-before.txt").write_text(qdisc_before)
             (rep_dir/"qdisc-after.txt").write_text(s1.cmd(f"tc -details -statistics qdisc show dev {s1s2}"))
     finally:
@@ -199,21 +292,37 @@ def run_linux(args, root: Path) -> None:
 def run_p4(args, root: Path) -> None:
     from common import add_access_delays
     from p4_bottleneck import build_p4_net
-    from run_p4_experiment import program_p4_switches, install_static_arp
+    from run_p4_experiment import (LINUX_MATCHED_DUALPI2_PROFILE,
+                                   install_static_arp, program_p4_switches)
     p4src = ROOT/args.p4src
     net_api, mn, clients, server, s1, s2 = build_p4_net(num_clients=2, p4src=args.p4src)
     try:
-        config = program_p4_switches(clients, server, initial_rate_mbit=args.rate_mbit,
-                                     reference_packet_bytes=args.reference_packet_bytes)
+        configure_experiment_interfaces([*clients, server, s1, s2])
+        validation_profile = dict(LINUX_MATCHED_DUALPI2_PROFILE)
+        validation_profile["export_qdelay_in_ipv4_id"] = 1
+        validation_profile["l4s_step_threshold_us"] = args.l4s_step_us
+        config = program_p4_switches(clients, server,
+                                     initial_rate_mbit=args.rate_mbit * args.p4_rate_scale,
+                                     reference_packet_bytes=args.reference_packet_bytes,
+                                     dualpi2_profile=validation_profile)
+        config["comparison_run"] = {
+            "target_bandwidth_mbit_each_direction": args.rate_mbit,
+            "active_queue_rate_pps": config["initial_queue_rate_pps"],
+            "queue_rate_scale": args.p4_rate_scale,
+            "dynamic_rate_change": False,
+        }
         add_access_delays(args.delay_ms, server, *clients); install_static_arp(clients, server)
         parent=root/"p4"; parent.mkdir(parents=True)
         record_environment(parent/"metadata.json", "p4", args, p4src)
         (parent/"p4-config.json").write_text(json.dumps(config, indent=2)+"\n")
         egress_port = int(config["switches"]["s1"]["bottleneck_egress_port"])
         egress_device = f"s1-eth{egress_port}"
+        # Per-packet deq_timedelta is exported in IPv4 ID for validation;
+        # avoid intrusive control-plane polling while BMv2 forwards traffic.
+        sample_queue = lambda: {}
         for rep in range(1,args.repetitions+1):
             run_phases(clients, server, parent/f"rep_{rep:02d}", args.phase_seconds, args.sample_ms,
-                       ("h1-eth0","h2-eth0"), s1, egress_device)
+                       ("h1-eth0","h2-eth0"), s1, egress_device, sample_queue)
     finally:
         mn.stop()
 
@@ -227,18 +336,27 @@ def main() -> None:
     parser.add_argument("--rate-mbit", type=float, default=10.0)
     parser.add_argument("--delay-ms", type=float, default=20.0)
     parser.add_argument("--reference-packet-bytes", type=int, default=1500)
+    parser.add_argument("--l4s-step-us", type=int, default=5000,
+                        help="native L4S step threshold used by both backends")
+    parser.add_argument("--p4-rate-scale", type=float, default=1.0,
+                        help="calibration factor for BMv2's packet-rate limiter")
     parser.add_argument("--p4src", default="dualpi2_repaired_v1.2.0.p4")
     parser.add_argument("--output", type=Path)
     args=parser.parse_args()
     if os.geteuid()!=0: raise SystemExit("run_l4s_comparison.py must run as root")
-    if args.repetitions<1 or args.phase_seconds<=0 or args.sample_ms<=0: parser.error("invalid repetition/timing values")
+    if (args.repetitions<1 or args.phase_seconds<=0 or args.sample_ms<=0
+            or args.l4s_step_us < 0 or args.p4_rate_scale <= 0):
+        parser.error("invalid repetition/timing/AQM values")
     root=args.output or (ROOT/"experiments"/time.strftime("%Y%m%d_%H%M%S_linux_p4_validation"))
     root.mkdir(parents=True, exist_ok=True)
     manifest=root/"manifest.json"
     if not manifest.exists():
         manifest.write_text(json.dumps({"experiment":"linux-p4-l4s-behavioral-comparison",
             "schedule":phase_schedule(args.phase_seconds), "rate_mbit":args.rate_mbit,
-            "delay_ms":args.delay_ms, "repetitions":args.repetitions}, indent=2)+"\n")
+            "delay_ms":args.delay_ms, "phase_seconds": args.phase_seconds,
+            "l4s_step_us": args.l4s_step_us, "mtu_bytes": 1500,
+            "p4_rate_scale": args.p4_rate_scale,
+            "repetitions":args.repetitions}, indent=2)+"\n")
     if args.backend=="linux": run_linux(args,root)
     else: run_p4(args,root)
     print(root)
